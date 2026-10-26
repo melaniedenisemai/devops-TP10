@@ -1,0 +1,160 @@
+name: Helm CD Multi-Environment Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+
+env:
+  CHART_PATH: ./devops-portfolio
+  KUBECONFIG_SECRET: ${{ secrets.KUBECONFIG_RAW }}
+
+jobs:
+  # ── FASE 1: VALIDACIÓN Y RENDER PREVIO (PATRÓN TP10B) ────────
+  render-validation:
+    name: Lint & Render First Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      - name: Instalar Helm CLI
+        uses: azure/setup-helm@v4
+        with:
+          version: 'v3.13.0'
+
+      - name: Instalar herramientas de validación
+        run: pip install PyYAML yamllint
+
+      - name: Ejecutar Helm Lint
+        run: helm lint ${{ env.CHART_PATH }}
+
+      - name: Renderizar Staging (helm template)
+        run: |
+          helm template test-staging ${{ env.CHART_PATH }} \
+            -f ${{ env.CHART_PATH }}/values-staging.yaml > rendered-staging.yaml
+
+      - name: Renderizar Producción (helm template)
+        run: |
+          helm template test-prod ${{ env.CHART_PATH }} \
+            -f ${{ env.CHART_PATH }}/values-prod.yaml > rendered-prod.yaml
+
+      - name: Auditar Sintaxis YAML Pura
+        run: |
+          python3 -c "
+          import yaml
+          for f in ['rendered-staging.yaml', 'rendered-prod.yaml']:
+              with open(f) as stream:
+                  docs = list(yaml.safe_load_all(stream))
+                  print(f'[PASS] {f}: {len(docs)} objetos válidos de K8s.')
+          "
+
+      - name: Preservar Manifiestos Renderizados como Artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: k8s-rendered-manifests
+          path: |
+            rendered-staging.yaml
+            rendered-prod.yaml
+          retention-days: 7
+
+  # ── FASE 2: DESPLIEGUE EN STAGING (AUTOMÁTICO) ───────────────
+  deploy-staging:
+    name: Deploy to Staging (Helm)
+    runs-on: ubuntu-latest
+    needs: render-validation
+    environment:
+      name: staging
+      url: http://staging.devops-portfolio.local
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: 'v3.13.0'
+
+      - name: Configurar Kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_RAW }}" > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Actualizar/Instalar Release en Staging
+        run: |
+          helm upgrade --install notes-staging ${{ env.CHART_PATH }} \
+            --namespace staging \
+            --create-namespace \
+            -f ${{ env.CHART_PATH }}/values-staging.yaml \
+            --set backend.image.tag="sha-${{ github.sha }}" \
+            --wait --timeout 3m
+
+      - name: Smoke Test en Staging
+        run: |
+          sleep 10
+          STATUS=$(kubectl exec -n staging deployment/notes-frontend -- curl -s -o /dev/null -w "%{http_code}" http://notes-backend:5000/health || echo "000")
+          if [ "$STATUS" = "200" ]; then
+            echo "Staging respondiendo 200 OK en /health"
+          else
+            echo "Fallo crítico en Staging: HTTP $STATUS"
+            exit 1
+          fi
+
+  # ── FASE 3: DESPLIEGUE EN PRODUCCIÓN (APROBACIÓN + ROLLBACK) ──
+  deploy-production:
+    name: Deploy to Production (Helm)
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: http://devops-portfolio.com
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: 'v3.13.0'
+
+      - name: Configurar Kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_RAW }}" > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Desplegar Release en Producción
+        id: helm_deploy
+        run: |
+          echo "Desplegando versión sha-${{ github.sha }} en Producción..."
+          helm upgrade --install notes-prod ${{ env.CHART_PATH }} \
+            --namespace production \
+            --create-namespace \
+            -f ${{ env.CHART_PATH }}/values-prod.yaml \
+            --set backend.image.tag="sha-${{ github.sha }}" \
+            --wait --timeout 3m
+
+      - name: Smoke Test Post-Despliegue en Producción
+        id: smoke_test
+        run: |
+          sleep 10
+          STATUS=$(kubectl exec -n production deployment/notes-frontend -- curl -s -o /dev/null -w "%{http_code}" http://notes-backend:5000/health || echo "000")
+          if [ "$STATUS" = "200" ]; then
+            echo "Producción operativa y saludable: HTTP $STATUS"
+          else
+            echo "Error crítico: Producción devolvió HTTP $STATUS (esperado 200)"
+            exit 1
+          fi
+
+      - name: Rollback Automático de Release de Helm
+        if: failure() && steps.helm_deploy.outcome == 'success'
+        run: |
+          echo "SMOKE TEST FALLIDO: INICIANDO ROLLBACK DE HELM EN PRODUCCIÓN"
+          helm rollback notes-prod 0 --namespace production --wait
+          echo "Estado tras el rollback:"
+          helm history notes-prod --namespace production
+          echo "Rollback completado exitosamente a la revisión previa estable."
+
+      - name: Resumen del Historial de Producción
+        if: always()
+        run: |
+          helm history notes-prod --namespace production || true

@@ -1,0 +1,42 @@
+global:
+  environment: staging
+  namespace: staging
+
+backend:
+  replicas: 1
+  image:
+    repository: melaniedmai/devops-portfolio
+    tag: latest
+    pullPolicy: Always
+  resources:
+    requests:
+      memory: "64Mi"
+      cpu: "50m"
+    limits:
+      memory: "128Mi"
+      cpu: "200m"
+
+frontend:
+  replicas: 1
+  resources:
+    requests:
+      memory: "32Mi"
+      cpu: "25m"
+    limits:
+      memory: "64Mi"
+      cpu: "100m"
+
+postgres:
+  storage:
+    size: 1Gi
+  credentials:
+    dbName: notesdb_staging
+    user: postgres
+    password: "staging-secret-password-2026"
+
+ingress:
+  enabled: true
+  host: staging.devops-portfolio.local
+
+hpa:
+  enabled: false
