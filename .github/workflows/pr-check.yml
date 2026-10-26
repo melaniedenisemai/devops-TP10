@@ -1,0 +1,42 @@
+name: PR Check - Validación de Calidad y Helm Chart
+
+on:
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  helm-validation:
+    name: Validar y Renderizar Helm Chart (Render First)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+
+      - name: Instalar Helm CLI
+        uses: azure/setup-helm@v4
+        with:
+          version: 'v3.13.0'
+
+      - name: Validar estructura y metadata del Chart (Helm Lint)
+        run: |
+          helm lint devops-portfolio/
+
+      - name: Renderizar Plantillas Go a YAML puro de Kubernetes
+        run: |
+          helm template mi-app ./devops-portfolio -f values-prod.yaml > manifests-rendered-prod.yaml
+
+      - name: Validar Sintaxis YAML del Manifiesto Renderizado
+        run: |
+          python3 -c "
+          import yaml
+          with open('manifests-rendered-prod.yaml') as f:
+              docs = list(yaml.safe_load_all(f))
+              print(f'[OK] Se procesaron correctamente {len(docs)} objetos de K8s.')
+          "
+
+      - name: Publicar Artefacto con los Manifiestos Renderizados
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifiestos-k8s-renderizados
+          path: manifests-rendered-prod.yaml
+          retention-days: 7
